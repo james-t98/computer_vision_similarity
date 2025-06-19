@@ -1,263 +1,218 @@
-# import streamlit as st
-# import cv2
-# import mediapipe as mp
-# import numpy as np
-# from scipy.spatial.distance import cosine
-# import tempfile
-# import os
-# import matplotlib.pyplot as plt
-
-# st.set_page_config(page_title="Athlete Similarity", layout="wide")
-
-# # --- Helper Functions ---
-# def extract_frames(video_path, max_frames=100):
-#     cap = cv2.VideoCapture(video_path)
-#     frames = []
-#     count = 0
-#     while cap.isOpened() and count < max_frames:
-#         ret, frame = cap.read()
-#         if not ret:
-#             break
-#         frame = cv2.resize(frame, (512, 512))
-#         frames.append(frame)
-#         count += 1
-#     cap.release()
-#     return frames
-
-# def extract_pose_keypoints(frames):
-#     mp_pose = mp.solutions.pose
-#     pose = mp_pose.Pose()
-#     keypoints_list = []
-
-#     for frame in frames:
-#         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-#         results = pose.process(rgb_frame)
-
-#         if results.pose_landmarks:
-#             keypoints = []
-#             for landmark in results.pose_landmarks.landmark:
-#                 keypoints.extend([landmark.x, landmark.y, landmark.z])
-#             keypoints_list.append(keypoints)
-#         else:
-#             keypoints_list.append([0] * (33 * 3))
-    
-#     pose.close()
-#     return np.array(keypoints_list)
-
-# def generate_embedding(keypoints_array):
-#     return np.mean(keypoints_array, axis=0)
-
-# def compute_similarity(embedding1, embedding2):
-#     return 1 - cosine(embedding1, embedding2)
-
-# def visualize_similarity(pose1, pose2):
-#     min_len = min(len(pose1), len(pose2))
-#     distances = [np.linalg.norm(p1 - p2) for p1, p2 in zip(pose1[:min_len], pose2[:min_len])]
-#     fig, ax = plt.subplots()
-#     ax.plot(distances, color='orange')
-#     ax.set_title("Pose Distance Over Time")
-#     ax.set_xlabel("Frame")
-#     ax.set_ylabel("L2 Distance")
-#     ax.grid(True)
-#     st.pyplot(fig)
-
-# # --- Streamlit UI ---
-# st.title("🏃 Athlete Similarity Comparison (MediaPipe + AI)")
-
-# col1, col2 = st.columns(2)
-
-# with col1:
-#     video1 = st.file_uploader("Upload First Athlete Video", type=["mp4", "mov"], key="video1")
-
-# with col2:
-#     video2 = st.file_uploader("Upload Second Athlete Video", type=["mp4", "mov"], key="video2")
-
-# if video1 and video2:
-#     with st.spinner("🔍 Processing videos and extracting poses..."):
-#         temp1 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-#         temp1.write(video1.read())
-#         temp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-#         temp2.write(video2.read())
-
-#         frames1 = extract_frames(temp1.name)
-#         frames2 = extract_frames(temp2.name)
-
-#         pose1 = extract_pose_keypoints(frames1)
-#         pose2 = extract_pose_keypoints(frames2)
-
-#         emb1 = generate_embedding(pose1)
-#         emb2 = generate_embedding(pose2)
-
-#         score = compute_similarity(emb1, emb2)
-
-#         os.remove(temp1.name)
-#         os.remove(temp2.name)
-
-#     st.success(f"✅ Similarity Score: **{score:.4f}** (1.0 = identical, 0 = different)")
-
-#     st.markdown("---")
-#     st.subheader("Pose Comparison Details")
-#     st.write("Pose embeddings were calculated using 3D keypoints from MediaPipe Pose, averaged across frames from each video.")
-
-#     visualize_similarity(pose1, pose2)
-
-# else:
-#     st.info("Please upload two video files to begin the comparison.")
-
 import streamlit as st
 import cv2
 import numpy as np
 import tempfile
-import mediapipe as mp
-from scipy.spatial.distance import cosine
-from fastdtw import fastdtw
 import matplotlib.pyplot as plt
-import os
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
+import mediapipe as mp
+from matplotlib.animation import FuncAnimation
+from io import BytesIO
+import base64
+import datetime
 
-st.set_page_config(page_title="Athlete Pose Comparison", layout="wide")
+# Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils  # Moved to global scope
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
 
-def extract_frames(video_path, max_frames=150, step=2):
+# === Pose Extraction and Visualization ===
+def extract_keypoints_with_visualization(video_path, max_frames=None):
+    """
+    Extracts pose keypoints and draws annotated landmarks on each frame
+
+    Args:
+        video_path: Path to video file
+        max_frames: Optional max number of frames to process
+
+    Returns:
+        tuple: (keypoints as ndarray, list of annotated RGB frames)
+    """
+    pose = mp_pose.Pose(static_image_mode=False,
+                        model_complexity=2,
+                        min_detection_confidence=0.7,
+                        min_tracking_confidence=0.7)
+
     cap = cv2.VideoCapture(video_path)
-    frames = []
-    count = 0
-    while cap.isOpened() and len(frames) < max_frames:
+    keypoints = []
+    annotated_frames = []
+
+    while cap.isOpened() and (max_frames is None or len(keypoints) < max_frames):
         ret, frame = cap.read()
         if not ret:
             break
-        if count % step == 0:
-            frame = cv2.resize(frame, (512, 512))
-            frames.append(frame)
-        count += 1
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(frame_rgb)
+
+        annotated_frame = frame_rgb.copy()
+        if results.pose_landmarks:
+            kps = [(lm.x, lm.y, lm.z) for lm in results.pose_landmarks.landmark]
+            keypoints.append(kps)
+
+            mp_drawing.draw_landmarks(
+                annotated_frame,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
+            )
+
+        annotated_frames.append(annotated_frame)
+
     cap.release()
-    return frames
-
-def extract_keypoints(frames):
-    pose = mp_pose.Pose()
-    keypoints_list = []
-    for frame in frames:
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb_frame)
-        if results.pose_landmarks:
-            keypoints = []
-            for lm in results.pose_landmarks.landmark:
-                keypoints.extend([lm.x, lm.y, lm.z])
-            keypoints_list.append(keypoints)
-        else:
-            keypoints_list.append([0] * (33 * 3))
     pose.close()
-    return np.array(keypoints_list)
 
-def draw_pose_on_frame(frame, pose_landmarks):
-    annotated_frame = frame.copy()
-    mp_drawing.draw_landmarks(
-        annotated_frame,
-        pose_landmarks,
-        mp_pose.POSE_CONNECTIONS,
-        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-        mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2)
-    )
-    return annotated_frame
+    return np.array(keypoints), annotated_frames
 
-def compute_cosine_similarity(pose1, pose2):
-    emb1 = np.mean(pose1, axis=0)
-    emb2 = np.mean(pose2, axis=0)
-    return 1 - cosine(emb1, emb2)
+# === Fallback HTML video animation using image frames ===
+def frames_to_html_video(frames, frame_rate=30):
+    """
+    Converts a list of RGB frames to HTML5 video for inline display
 
-def compute_dtw_similarity(pose1, pose2):
-    distance, _ = fastdtw(pose1, pose2, dist=lambda x, y: cosine(x, y))
-    return distance
+    Args:
+        frames: List of frames
+        frame_rate: Frame playback rate
 
-def plot_trajectory(pose_sequence, label):
-    pose_sequence = np.array(pose_sequence)
-    if pose_sequence.ndim == 2 and pose_sequence.shape[1] >= 3:
-        x = pose_sequence[:, 0]
-        y = pose_sequence[:, 1]
-        plt.plot(x, y, label=label)
-        plt.xlabel("X")
-        plt.ylabel("Y")
-        plt.title("Trajectory of Nose Keypoint")
-        plt.legend()
+    Returns:
+        HTML string of video player
+    """
+    if not frames:
+        return "<p>No frames to display</p>"
 
-def create_annotated_video(frames, output_path):
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     height, width, _ = frames[0].shape
-    out = cv2.VideoWriter(output_path, fourcc, 15, (width, height))
-    pose = mp_pose.Pose()
-    
-    for frame in frames:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb)
-        if results.pose_landmarks:
-            annotated = draw_pose_on_frame(frame, results.pose_landmarks)
-        else:
-            annotated = frame
-        
-        # Convert back to BGR for video writing
-        annotated = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-        out.write(annotated)
-    
-    out.release()
-    pose.close()
+    fig, ax = plt.subplots(figsize=(width / 100, height / 100))
+    plt.axis('off')
+    im = ax.imshow(frames[0])
 
-st.title("🏃 Athlete Pose Comparison with Real-Time Overlays")
+    def update(frame):
+        im.set_array(frame)
+        return [im]
 
-col1, col2 = st.columns(2)
-with col1:
-    video1 = st.file_uploader("Upload Reference Video (No Overlay)", type=["mp4"], key="v1")
-with col2:
-    video2 = st.file_uploader("Upload Comparison Video (Overlayed)", type=["mp4"], key="v2")
+    ani = FuncAnimation(fig, update, frames=frames, interval=1000 / frame_rate, blit=True)
 
-if video1 and video2:
-    slow_motion = st.slider("Playback Speed (1 = normal, higher = slower)", 1, 5, 2)
-    with st.spinner("Processing videos..."):
-        # Save uploaded videos to temporary files
-        t1 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        t1.write(video1.read())
-        t2 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        t2.write(video2.read())
-        t1.close()
-        t2.close()
+    # Workaround for environments without ffmpeg
+    try:
+        video_html = ani.to_html5_video()
+    except RuntimeError:
+        video_html = "<p><b>Video rendering not supported (missing ffmpeg).</b></p>"
 
-        frames1 = extract_frames(t1.name, step=slow_motion)
-        frames2 = extract_frames(t2.name, step=slow_motion)
+    plt.close()
+    return video_html
 
-        keypoints1 = extract_keypoints(frames1)
-        keypoints2 = extract_keypoints(frames2)
+# === Core Comparison Logic ===
+def compare_videos_with_visualization(ref_path, stu_path, max_frames=100):
+    """
+    Compares two videos using pose keypoints and DTW
 
-        cosine_sim = compute_cosine_similarity(keypoints1, keypoints2)
-        dtw_dist = compute_dtw_similarity(keypoints1, keypoints2)
+    Args:
+        ref_path: Path to reference video
+        stu_path: Path to student video
+        max_frames: Max frames to compare
 
-        # Save annotated video2
-        annotated_path = "annotated_output.mp4"  # Using a fixed name
-        create_annotated_video(frames2, annotated_path)
+    Returns:
+        dict: Comparison results and plots
+    """
+    ref_kps, ref_frames = extract_keypoints_with_visualization(ref_path, max_frames)
+    stu_kps, stu_frames = extract_keypoints_with_visualization(stu_path, max_frames)
 
-    st.success(f"Cosine Similarity Score: {cosine_sim:.4f}")
-    st.success(f"DTW Distance (lower is more similar): {dtw_dist:.4f}")
+    results = {
+        'ref_frames': ref_frames,
+        'stu_frames': stu_frames
+    }
 
-    st.subheader("🎥 Video Comparison (Side-by-Side Playback)")
+    if len(ref_kps) > 0 and len(stu_kps) > 0:
+        distance, path = fastdtw(
+            ref_kps.reshape(len(ref_kps), -1),
+            stu_kps.reshape(len(stu_kps), -1),
+            dist=euclidean
+        )
+        normalized_distance = distance / max(len(ref_kps), len(stu_kps))
 
-    col5, col6 = st.columns(2)
-    with col5:
-        st.markdown("**Original Reference Video**")
-        st.video(t1.name)
-    with col6:
-        st.markdown("**Overlayed Comparison Video**")
-        st.video(annotated_path)
+        # Create summary comparison plot
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        path = np.array(path)
+        ax1.plot(path[:, 0], path[:, 1], 'b-', alpha=0.5)
+        ax1.set(xlabel='Reference Frames', ylabel='Student Frames', title='DTW Alignment Path')
+        ax1.grid(True)
 
-    st.subheader("📈 Trajectory Comparison of Nose Keypoint")
-    fig, ax = plt.subplots()
-    nose1 = [kp[:3] for kp in keypoints1]
-    nose2 = [kp[:3] for kp in keypoints2]
-    plot_trajectory(nose1, "Video 1")
-    plot_trajectory(nose2, "Video 2")
-    st.pyplot(fig)
+        kp_diff = np.mean(np.abs(ref_kps.mean(0) - stu_kps.mean(0)), axis=0)
+        ax2.bar(['X', 'Y', 'Z'], kp_diff)
+        ax2.set(title='Average Keypoint Differences', ylabel='Mean Absolute Difference')
 
-    # Clean up
-    os.remove(t1.name)
-    os.remove(t2.name)
-    if os.path.exists(annotated_path):
-        os.remove(annotated_path)
+        plt.tight_layout()
+        st.pyplot(fig)
+
+        results.update({
+            'dtw_distance': distance,
+            'normalized_distance': normalized_distance,
+            'keypoint_diff': kp_diff
+        })
+
+    return results
+
+# === Streamlit App Layout ===
+st.set_page_config(layout="wide")
+st.title("📊 Pose Comparison Tool")
+
+with st.sidebar:
+    st.header("Upload Videos")
+    ref_file = st.file_uploader("Upload Reference Video", type=["mp4", "mov"])
+    stu_file = st.file_uploader("Upload Student Video", type=["mp4", "mov"])
+    max_frames = st.slider("Max Frames to Process", min_value=10, max_value=500, value=200, step=10)
+
+if ref_file and stu_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as ref_temp:
+        ref_temp.write(ref_file.read())
+        ref_path = ref_temp.name
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as stu_temp:
+        stu_temp.write(stu_file.read())
+        stu_path = stu_temp.name
+
+    st.success("Videos uploaded successfully! Starting comparison...")
+
+    results = compare_videos_with_visualization(ref_path, stu_path, max_frames=max_frames)
+
+    st.subheader("🎥 Annotated Pose Videos")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Reference Video**")
+        ref_html = frames_to_html_video(results['ref_frames'])
+        st.components.v1.html(ref_html, height=360, width=320)
+
+    with col2:
+        st.markdown("**Student Video**")
+        stu_html = frames_to_html_video(results['stu_frames'])
+        st.components.v1.html(stu_html, height=360, width=320)
+
+    st.success("Comparison Completed Successfully!")
+    st.markdown(f"**DTW Distance:** {results['dtw_distance']:.2f}")
+    st.markdown(f"**Normalized DTW Distance:** {results['normalized_distance']:.4f}")
+    st.markdown(f"**Avg Keypoint Diff (XYZ):** {np.mean(results['keypoint_diff']):.4f}")
+
+    # Display comparison report
+    st.subheader("📋 Comparison Report")
+    report_text = f"""
+    ## Pose Comparison Summary Report
+
+    - **Date**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+    - **Max Frames Processed**: {max_frames}
+    - **DTW Distance**: {results['dtw_distance']:.2f}
+    - **Normalized DTW Distance**: {results['normalized_distance']:.4f}
+    - **Average Keypoint Difference (XYZ)**: {np.mean(results['keypoint_diff']):.4f}
+    """
+    st.markdown(report_text)
+
+    # Report download button (currently disabled)
+    # Uncomment to enable actual download functionality in future
+    # buffer = BytesIO()
+    # buffer.write(report_text.encode())
+    # buffer.seek(0)
+    # st.download_button("Download Report", buffer, file_name="pose_comparison_report.txt")
+
+    if st.button("Download Report"):
+        st.warning("🔒 Download functionality will be available soon.")
+
 else:
-    st.info("Please upload two videos to begin.")
+    st.info("Please upload both a reference and student video to begin.")
